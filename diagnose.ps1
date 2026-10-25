@@ -42,8 +42,20 @@ Try-Run 'HARDWARE' {
 	"Uptime:   {0:N1} days (booted $($os.LastBootUpTime))" -f ((Get-Date) - $os.LastBootUpTime).TotalDays
 	Get-CimInstance Win32_VideoController | ForEach-Object { "GPU:      $($_.Name)  driver $($_.DriverVersion) ($($_.DriverDate.ToString('yyyy-MM-dd')))  $($_.CurrentHorizontalResolution)x$($_.CurrentVerticalResolution)@$($_.CurrentRefreshRate)" }
 	"Monitors: $((Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | Measure-Object).Count)"
-	$rel = Get-CimInstance Win32_ReliabilityStabilityMetrics | Select-Object -First 1
-	if ($rel) { "Reliability index: {0:N2} / 10 (Reliability Monitor, latest)" -f $rel.SystemStabilityIndex }
+	# Hourly samples; the trend says more than the latest value, and interpret.md judges on it.
+	$relAll = @(Get-CimInstance Win32_ReliabilityStabilityMetrics | Sort-Object TimeGenerated -Descending)
+	$rel = $relAll | Select-Object -First 1
+	$relAgo = @{}; foreach ($d in 7, 30) { $relAgo[$d] = ($relAll | Where-Object { $_.TimeGenerated -le (Get-Date).AddDays(-$d) } | Select-Object -First 1).SystemStabilityIndex }
+	if ($rel) {
+		"Reliability index: {0:N2} / 10 now, {1} 7 days ago, {2} 30 days ago (Reliability Monitor)" -f $rel.SystemStabilityIndex, $(if ($null -ne $relAgo[7]) { '{0:N2}' -f $relAgo[7] } else { 'n/a' }), $(if ($null -ne $relAgo[30]) { '{0:N2}' -f $relAgo[30] } else { 'n/a' })
+		# Reliability records mix successes (WindowsUpdateClient 19 = installed, MsiInstaller 1033) with failures.
+		# Only failures lower the index, so list just those to explain the score.
+		$relFail = 'Application Error|1000', 'Application Hang|1002', 'Microsoft-Windows-WindowsUpdateClient|20', 'MsiInstaller|11708', 'EventLog|6008', 'Microsoft-Windows-Kernel-Power|41', 'Microsoft-Windows-WER-SystemErrorReporting|1001'
+		$since30 = [Management.ManagementDateTimeConverter]::ToDmtfDateTime((Get-Date).AddDays(-30))
+		$relRec = @(Get-CimInstance Win32_ReliabilityRecords -Filter "TimeGenerated > '$since30'" | Where-Object { "$($_.SourceName)|$($_.EventIdentifier)" -in $relFail })
+		'  failures that lowered it, 30 days:' + $(if (-not $relRec) { ' none' })
+		$relRec | Group-Object SourceName, EventIdentifier, ProductName | Sort-Object Count -Descending | Select-Object -First 8 | ForEach-Object { "    x{0,-3} {1,-28} {2,-5} {3}" -f $_.Count, ($_.Group[0].SourceName -replace '^Microsoft-Windows-', ''), $_.Group[0].EventIdentifier, (Trunc $_.Group[0].ProductName 60) }
+	}
 	$ws = Get-CimInstance Win32_WinSAT
 	if ($ws.WinSATAssessmentState -eq 1) { "WinSAT:   cpu=$($ws.CPUScore) mem=$($ws.MemoryScore) disk=$($ws.DiskScore) gfx=$($ws.GraphicsScore) d3d=$($ws.D3DScore) (max 9.9)" }
 	Metric 'model'            "$($cs.Manufacturer) $($cs.Model)"
@@ -60,6 +72,9 @@ Try-Run 'HARDWARE' {
 	Metric 'monitors'         ((Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | Measure-Object).Count)
 	Metric 'gpu_driver'       ((Get-CimInstance Win32_VideoController | Select-Object -First 1).DriverVersion)
 	if ($rel) { Metric 'reliability_index' ([math]::Round($rel.SystemStabilityIndex, 2)) }
+	if ($null -ne $relAgo[7])  { Metric 'reliability_7d_ago'  ([math]::Round($relAgo[7], 2)) }
+	if ($null -ne $relAgo[30]) { Metric 'reliability_30d_ago' ([math]::Round($relAgo[30], 2)) }
+	if ($rel) { Metric 'reliability_failures_30d' @($relRec | Group-Object SourceName, EventIdentifier, ProductName | Sort-Object Count -Descending | Select-Object -First 8 | ForEach-Object { @{ source = $_.Group[0].SourceName; id = $_.Group[0].EventIdentifier; product = $_.Group[0].ProductName; count = $_.Count } }) }
 	if ($ws.WinSATAssessmentState -eq 1) {
 		Metric 'winsat_cpu' $ws.CPUScore; Metric 'winsat_mem' $ws.MemoryScore; Metric 'winsat_disk' $ws.DiskScore
 		Metric 'winsat_gfx' $ws.GraphicsScore; Metric 'winsat_d3d' $ws.D3DScore
@@ -193,8 +208,20 @@ Try-Run 'PROCESSES' {
 	$procs | Group-Object Name | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count; WS_MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum/1MB); Private_MB = [math]::Round(($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum/1MB) } } | Sort-Object Private_MB -Descending | Select-Object -First 20 | Format-Table -AutoSize | Out-String
 	'-- Electron / Chromium-style apps (many processes each) --'
 	$procs | Where-Object { $_.Path -and (Test-Path -LiteralPath (Join-Path (Split-Path $_.Path) 'resources\app.asar')) } | Group-Object Name | ForEach-Object { [pscustomobject]@{ App = $_.Name; Procs = $_.Count; MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum/1MB); Path = Split-Path $_.Group[0].Path } } | Sort-Object MB -Descending | Format-Table -AutoSize | Out-String -Width 200
-	'-- WebView2 hosts (by parent process) --'
-	Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Group-Object ParentProcessId | ForEach-Object { $pp = Get-Process -Id $_.Name; "  x{0,-3} hosted by {1}" -f $_.Count, $(if ($pp.Name -eq 'msedgewebview2') { 'msedgewebview2 (nested; check --user-data-dir)' } elseif ($pp) { $pp.Name } else { 'exited parent' }) }
+	'-- WebView2 hosts (by host app; Private MB) --'
+	# Most WebView2 processes are children of another msedgewebview2, so the parent alone names nothing. Each
+	# browser process carries --webview-exe-name=<host app>; helpers without it (crashpad) inherit their parent's host.
+	$wv = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'")
+	$hostOf = @{}; foreach ($p in $wv) { if ($p.CommandLine -match '--webview-exe-name=(\S+)') { $hostOf[$p.ProcessId] = $Matches[1] } }
+	$wvHosts = $wv | ForEach-Object {
+		$h = $hostOf[$_.ProcessId]
+		if (-not $h) { $h = $hostOf[$_.ParentProcessId] }
+		if (-not $h) { $pp = Get-Process -Id $_.ParentProcessId; $h = if ($pp -and $pp.Name -ne 'msedgewebview2') { "$($pp.Name).exe" } else { 'unknown' } }
+		[pscustomobject]@{ Host = $h; Private = $_.PrivatePageCount }
+	} | Group-Object Host | ForEach-Object { [pscustomobject]@{ Host = $_.Name; Procs = $_.Count; Private_MB = [math]::Round(($_.Group | Measure-Object Private -Sum).Sum/1MB) } } | Sort-Object Private_MB -Descending
+	$wvHosts | ForEach-Object { "  x{0,-3} {1,6:N0} MB  hosted by {2}" -f $_.Procs, $_.Private_MB, $_.Host }
+	$sync = @($procs | Where-Object Name -in 'OneDrive', 'GoogleDriveFS', 'Dropbox', 'iCloudDrive', 'MEGAsync', 'nextcloud', 'pCloud', 'Box' | ForEach-Object Name | Select-Object -Unique)
+	'Cloud sync clients running: ' + $(if ($sync) { $sync -join ', ' } else { 'none' }) + $(if ($sync.Count -gt 1) { '  -> MORE THAN ONE: each adds Explorer hooks and a file watcher; keep one' })
 	'-- VM / hypervisor --'
 	$dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard
 	"VBS status: $($dg.VirtualizationBasedSecurityStatus) (2=running)   services running: $($dg.SecurityServicesRunning -join ',') (1=CredGuard 2=HVCI/MemoryIntegrity 3=SecureLaunch 4=SMM 5=KernelShadowStacks)   HypervisorPresent: $((Get-CimInstance Win32_ComputerSystem).HypervisorPresent)"
@@ -208,7 +235,9 @@ Try-Run 'PROCESSES' {
 	Metric 'vbs_status'        $dg.VirtualizationBasedSecurityStatus
 	Metric 'vbs_services'      ($dg.SecurityServicesRunning -join ',')
 	Metric 'hypervisor_present' (Get-CimInstance Win32_ComputerSystem).HypervisorPresent
-	Metric 'webview2_count'    ((Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Measure-Object).Count)
+	Metric 'webview2_count'    $wv.Count
+	Metric 'webview2_hosts'    @($wvHosts | ForEach-Object { @{ host = $_.Host; procs = $_.Procs; private_mb = $_.Private_MB } })
+	Metric 'cloud_sync_clients' $sync
 	Metric 'top_memory'        ($procs | Group-Object Name | ForEach-Object { @{ name = $_.Name; count = $_.Count; private_mb = [math]::Round(($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum/1MB) } } | Sort-Object { -$_.private_mb } | Select-Object -First 15)
 	Metric 'electron_apps'     ($procs | Where-Object { $_.Path -and (Test-Path -LiteralPath (Join-Path (Split-Path $_.Path) 'resources\app.asar')) } | Group-Object Name | ForEach-Object { @{ name = $_.Name; procs = $_.Count; ws_mb = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum/1MB) } })
 }
@@ -231,10 +260,20 @@ Try-Run 'STARTUP' {
 			"  {0,-56} {1:X2} {2,-8} {3,-22} {4}" -f $name, $b, $(if ($b -band 1) { 'disabled' } else { 'enabled' }), ($k -replace ':.*StartupApproved', ''), $(if ($name -notin $present) { 'STALE' })
 		}
 	}
-	'-- Startup app launch timeline this boot (Shell-Core 9707 start / 9708 finish; the gap is what each Run entry cost) --'
+	'-- Startup app cost this boot, slowest first (Shell-Core 9707 start to 9708 finish for each Run entry) --'
 	$sc = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Shell-Core/Operational'; Id=9707,9708; StartTime=$bootTime } | Sort-Object TimeCreated
 	if ($sc) {
-		$sc | ForEach-Object { "  T+{0,4}s  {1}  {2}" -f [int]($_.TimeCreated - $bootTime).TotalSeconds, $(if ($_.Id -eq 9707) { 'start ' } else { 'finish' }), (Trunc (($_.Message -replace '.*command ', '') -replace '[''"]', '' -replace '\.$', '') 90) }
+		# Pair each start with the first unused finish for the same command; a 9708 adds "(PID n)" to the text.
+		$cmdOf = { param($e) (($e.Message -replace '.*command ', '') -replace '[''"]', '' -replace '\.$', '' -replace '\s*\(PID \d+\)$', '').Trim() }
+		$used = @{}
+		$costs = foreach ($s in $sc | Where-Object Id -eq 9707) {
+			$c = & $cmdOf $s
+			$f = $sc | Where-Object { $_.Id -eq 9708 -and $_.TimeCreated -ge $s.TimeCreated -and -not $used[$_.RecordId] -and (& $cmdOf $_) -eq $c } | Select-Object -First 1
+			if ($f) { $used[$f.RecordId] = $true }
+			[pscustomobject]@{ StartTplus = [int]($s.TimeCreated - $bootTime).TotalSeconds; Seconds = $(if ($f) { [math]::Round(($f.TimeCreated - $s.TimeCreated).TotalSeconds, 1) } else { $null }); Command = $c }
+		}
+		$costs | Sort-Object { -[double]$_.Seconds } | ForEach-Object { "  {0,6}s  at T+{1,4}s  {2}" -f $(if ($null -ne $_.Seconds) { $_.Seconds } else { '?' }), $_.StartTplus, (Trunc $_.Command 90) }
+		Metric 'startup_costs_s' @($costs | Sort-Object { -[double]$_.Seconds } | ForEach-Object { @{ command = (Trunc $_.Command 90); start_tplus_s = $_.StartTplus; seconds = $_.Seconds } })
 	} else { '  (no Shell-Core startup events this boot)' }
 	'-- Non-Microsoft running services --'
 	Get-CimInstance Win32_Service | Where-Object { $_.State -eq 'Running' -and $_.PathName -notmatch 'Windows\\(system32|SysWOW64|servicing)' -and $_.PathName } | Select-Object Name, StartMode, @{n='Path';e={ (($_.PathName -replace '"','') -split '\s+[-/]')[0] }} | Sort-Object Path | Format-Table -AutoSize | Out-String -Width 220
@@ -354,6 +393,14 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	'-- Hardware / storage / power warnings and errors, 30 days (WHEA, disk, Ntfs, volmgr, Kernel-Power 41) --'
 	$hw = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='disk','storahci','stornvme','Ntfs','volmgr','Microsoft-Windows-WHEA-Logger','Microsoft-Windows-Kernel-Power'; Level=1,2,3; StartTime=(Get-Date).AddDays(-30) } | Group-Object ProviderName, Id
 	if ($hw) { $hw | ForEach-Object { "  x$($_.Count)  $($_.Name)" } } else { '  none' }
+	# A 41 count alone does not say what happened. The named fields do: a bugcheck code is a blue screen, a power-button
+	# timestamp is a forced power-off, SleepInProgress non-zero means it died during a sleep or hibernate transition.
+	$kp41 = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41; StartTime=(Get-Date).AddDays(-30) } -MaxEvents 3)
+	foreach ($e in $kp41) {
+		$f = @{}; ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { $f[$_.Name] = $_.'#text' }
+		$why = if ([int64]$f['BugcheckCode'] -ne 0) { 'blue screen (check Windows\Minidump)' } elseif ([int64]$f['PowerButtonTimestamp'] -ne 0 -or $f['LongPowerButtonPressDetected'] -eq 'true') { 'power button held (forced off)' } elseif ([int]$f['SleepInProgress'] -ne 0) { 'lost during a sleep/hibernate transition' } else { 'no bugcheck, no button: power loss or hard hang' }
+		"    Kernel-Power 41 at {0:yyyy-MM-dd HH:mm}: bugcheck={1} sleepInProgress={2} powerButton={3} -> {4}" -f $e.TimeCreated, $f['BugcheckCode'], $f['SleepInProgress'], $f['PowerButtonTimestamp'], $why
+	}
 	'-- Biometrics secure-component failures (1600): pairs with a SynaHlp-style 7009 from the fingerprint driver --'
 	$bio1600 = @(Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Biometrics/Operational'; Id=1600; StartTime=(Get-Date).AddDays(-30) })
 	"  $($bio1600.Count) in 30 days" + $(if ($bio1600) { "  (latest $(($bio1600 | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated))" })
@@ -463,6 +510,9 @@ Try-Run 'METRICS BASELINE (JSON)' {
 
 	# Compare against the newest earlier baseline before writing this one, so the delta is run-over-run.
 	$prior = Get-ChildItem (Join-Path $dir 'win-diag-metrics_*.json') | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+	# Read it now: when -JsonOut names an existing file, $prior is that file and the write below replaces it, so
+	# reading after the write compared the run against itself (every delta 0).
+	if ($prior) { $priorAge = [int]((Get-Date) - $prior.LastWriteTime).TotalHours; $old = (Get-Content -LiteralPath $prior.FullName -Raw | ConvertFrom-Json).metrics }
 
 	$doc = [ordered]@{
 		schema       = 'win-diag-metrics/1'
@@ -477,8 +527,7 @@ Try-Run 'METRICS BASELINE (JSON)' {
 	"  written: $path"
 
 	if (-not $prior) { '  (no earlier baseline in this folder; this run is the reference for the next one)'; return }
-	"  comparing against: $($prior.Name)  ($([int]((Get-Date) - $prior.LastWriteTime).TotalHours) h ago)"
-	$old = (Get-Content -LiteralPath $prior.FullName -Raw | ConvertFrom-Json).metrics
+	"  comparing against: $($prior.Name)  ($priorAge h ago)"
 	# Only the scalar KPIs worth tracking. Direction says which way is bad, so a regression is obvious at a glance.
 	$track = [ordered]@{
 		'cpu_pct'            = 'lower'; 'cpu_privileged_pct' = 'lower'; 'cpu_queue_len'     = 'lower'

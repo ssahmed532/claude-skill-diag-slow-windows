@@ -4,7 +4,7 @@ description: Custom, bespoke Claude Skill to diagnose a slow Windows 11 installa
 disable-model-invocation: true
 allowed-tools: PowerShell Bash Read
 metadata:
-  version: 1.0.1
+  version: 1.1.0
 ---
 
 Decide whether this Windows 11 machine is slow and why. Analyse only; make no changes unless the user asks afterwards.

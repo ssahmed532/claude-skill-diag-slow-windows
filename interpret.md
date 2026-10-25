@@ -89,15 +89,15 @@ Then say: a reboot is needed; the ACPI node may reappear as an unknown device an
 - Group Policy 1502 at T+80 s on a non-domain machine is the local policy object being processed and is normal.
 - Milestones are measured from kernel start, so "user logon tasks begin" and "last startup app launched" include however long the machine sat at the lock screen. The script prints Winlogon 7001 (user signed in) and the sign-in-to-last-app span; judge startup cost on that span (healthy under 60 s), not on the raw T+. A logon at T+600 s with no Kernel-Power 42/107 in between is a user who walked away, not a slow boot.
 - **One boot can contain several sign-ins.** A sign-out (Winlogon 7002) and a later sign-in replay the whole Run-key set, so the 9707/9708 timeline shows a second burst hours into the boot. The script now scores each 7001 against only the startup apps that ran before the next 7001 and prints one span per session; before that fix it spanned the first sign-in to the very last app and reported 14188 s on a machine whose real startup cost was 72 s. If two spans are printed, the later one is usually the faster of the two because the caches are warm — quote the first for cold-start cost.
-- The 9707/9708 list shows what each startup entry cost. Edge's `setup.exe --msedge --delete-old-versions` running 8 s at logon is the Edge updater cleaning up after an update, transient.
+- The startup cost list pairs each Shell-Core 9707 with its 9708 and sorts by seconds, so the slowest Run entry is the first line. A cloud sync client at 15 to 25 s is typical (GoogleDriveFS took 22 s on the ThinkPad E15); anything over 10 s that is not used at once is worth turning off at startup. Edge's `setup.exe --msedge --delete-old-versions` running 8 s at logon is the Edge updater cleaning up after an update, transient.
 
 ## PROCESSES and STARTUP: permanent background load
 
 Scale everything against the core count. Four cores at 1.5 GHz cannot hide what eight cores at 4 GHz can. Use the Private_MB column to rank memory; WorkingSet double-counts shared DLL pages (93 svchost instances at 1.7 GB working set are normal on a 32 GB machine).
 
 - Electron apps run 4 to 8 processes each and wake the CPU constantly. Discord, Slack, Teams, chat apps, AI desktop clients. Disable at login: Settings > Apps > Startup.
-- WebView2 hosts grouped by parent: hosted by `SearchHost` is the Start menu web pane, by a cloud sync client its UI, by `MicrosoftWindows.Client.CBS` the Widgets board. Hide the Widgets button on the taskbar to unload that one.
-- Two cloud sync clients at once (OneDrive plus Google Drive or Dropbox) double the Explorer hooks and the file-watcher load. Keep one running.
+- WebView2 hosts are grouped by the app that owns them (each WebView2 browser process names it in `--webview-exe-name`), with private memory per host. `SearchHost.exe` is the Start menu web pane, a cloud sync client is its UI, `MicrosoftWindows.Client.CBS` is the Widgets board, `utorrentie.exe` is uTorrent's ad pane. Hide the Widgets button on the taskbar to unload that one; the others go away when their app is closed. `unknown` means the parent exited.
+- Two cloud sync clients at once (OneDrive plus Google Drive or Dropbox) double the Explorer hooks and the file-watcher load. The script flags it as `MORE THAN ONE`. Keep one running: Settings > Apps > Startup, then quit the other from its tray icon.
 - VPN "threat protection" or web-filter services (`nordsec-threatprotection-service`) run even when the VPN is disconnected and add latency to every connection. Disable in the VPN app if unused.
 - RGB, mouse, audio and printer vendor helpers (iCUE, Logitech, Razer, Realtek tasks) belong on desktops, rarely on laptops.
 - OEM helper crashing repeatedly (Lenovo `UDClientService` faulting in ucrtbase) means run the OEM update tool; do not disable it.
@@ -122,6 +122,22 @@ Phone Link is `Microsoft.YourPhone`. Also turn off Settings > Bluetooth and devi
 ## PROCESSES: hypervisor and VBS
 
 `VBS status 2` with service `2` means Memory Integrity (HVCI) is on; `5` is kernel-mode hardware-enforced stack protection and is free on 11th-gen Intel and newer. `HypervisorPresent True` means Hyper-V is active for WSL, Docker or sandboxed apps. Together they cost a few percent CPU and raise kernel time; more on pre-2020 CPUs without MBEC. Only recommend turning Memory Integrity off after every other fix, and say it is a security trade-off: Windows Security > Device security > Core isolation.
+
+## HARDWARE: reliability index
+
+The script prints the index now, 7 days ago and 30 days ago, then the failures from the last 30 days that lowered it. Reliability Monitor also records successes (WindowsUpdateClient 19, MsiInstaller 1033); the script lists only failures: Application Error 1000, Application Hang 1002, WindowsUpdateClient 20, MsiInstaller 11708, EventLog 6008, Kernel-Power 41, WER-SystemErrorReporting 1001.
+
+- A low index is a stability signal, not a speed one. Say which failures drive it and whether any of them is slowness-related; Store app update failures and a crashing OEM updater can drag it below 5 on a machine that is fast.
+- Each failure costs most in the hour it lands and fades over weeks. A sharp drop between hourly samples points at the failures logged in that hour.
+
+## EVENT LOG: Kernel-Power 41 (unexpected shutdown)
+
+The script decodes the last three 41s from their named fields:
+
+- `bugcheck` non-zero: a blue screen. Read the code and the minidump.
+- `powerButton` non-zero: someone held the power button. Ask what was frozen at the time.
+- `sleepInProgress` non-zero: the machine died entering or leaving sleep or hibernate. Check for a BIOS update and whether it recurs after resume.
+- All zero: power loss or a hard hang. One in 30 days is not a pattern.
 
 ## HARDWARE: what cannot be fixed
 
@@ -166,7 +182,9 @@ Transparency on, VisualFXSetting "best appearance" or "let Windows choose", and 
 ## EVENT LOG traps
 
 - DistributedCOM 10005 or 10010 during shutdown are noise.
-- WindowsUpdateClient 20 for Store apps (`9N...` ids) is a Store app that failed to update, not a system update.
+- WindowsUpdateClient 20 for a Store product id (12 characters starting `9N`, `9P`, `9W` or `XP`, then the package name) is a Store app that failed to update, not a system update. Error 0x80073D02 means the app was open while the update tried to replace it: close it and update from the Microsoft Store. Each failure still lowers the reliability index.
+- Application Error 1000 for `fwdetect_v63.exe` under `C:\ProgramData\Lenovo\SystemUpdate\SessionSE\Repository` with exception 0xe0434352 (an unhandled .NET exception) is Lenovo System Update's firmware-detection package crashing during its scan. Not a slowness cause. Run Lenovo System Update and let it update itself first.
+- DriverFrameworks-UserMode 10111 ("Intel(R) Dynamic Tuning Processor Participant ... is offline") with 10120 (UMDF host terminated) is the Intel Dynamic Tuning helper restarting. It is the driver that applies the OEM power limits, so a repeat pattern can clamp the CPU. Once is a hiccup; get the current Intel DTT driver and BIOS from Lenovo System Update (or the OEM tool) either way.
 - Volsnap 36 (shadow storage limit) is a quota, not a disk fault.
 - Wi-Fi Direct Virtual Adapter power transition errors (NDIS 10317) are cosmetic unless Wi-Fi itself drops.
 - Netwtw10 7023 "secure boot debug logging Quasar" is Intel Wi-Fi driver chatter at every boot.
