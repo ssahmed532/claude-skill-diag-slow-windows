@@ -2,10 +2,18 @@
 # Run with:  pwsh -NoProfile -File diagnose.ps1 [-CheckUpdates]
 # Elevation is optional; sections that need it say so and are skipped when unavailable.
 # -CheckUpdates adds a Windows Update pending-search (COM, adds ~30 s).
-param([switch]$CheckUpdates)
+# -JsonOut writes the measured KPIs to a timestamped JSON file (default %TEMP%\win-diag-metrics_<stamp>.json)
+#   and prints a delta table against the newest earlier metrics file, so regressions show up run to run.
+# -NoJson suppresses that file.
+param([switch]$CheckUpdates, [string]$JsonOut, [switch]$NoJson)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
+
+# Metrics captured for the JSON baseline. Each section adds to this as it computes its figures, so the
+# JSON always holds the same numbers the text report printed (never a second, later sample).
+$script:M = [ordered]@{}
+function Metric($name, $value) { $script:M[$name] = $value }
 
 function Section($title) { ''; "==== $title ===="; }
 function Try-Run($title, [scriptblock]$body) {
@@ -38,6 +46,24 @@ Try-Run 'HARDWARE' {
 	if ($rel) { "Reliability index: {0:N2} / 10 (Reliability Monitor, latest)" -f $rel.SystemStabilityIndex }
 	$ws = Get-CimInstance Win32_WinSAT
 	if ($ws.WinSATAssessmentState -eq 1) { "WinSAT:   cpu=$($ws.CPUScore) mem=$($ws.MemoryScore) disk=$($ws.DiskScore) gfx=$($ws.GraphicsScore) d3d=$($ws.D3DScore) (max 9.9)" }
+	Metric 'model'            "$($cs.Manufacturer) $($cs.Model)"
+	Metric 'bios'             ([string]$bios.BIOSVersion)
+	Metric 'os_build'         $os.Version
+	Metric 'cpu'              $cpu.Name
+	Metric 'cpu_cores'        $cpu.NumberOfCores
+	Metric 'cpu_threads'      $cpu.NumberOfLogicalProcessors
+	Metric 'cpu_base_mhz'     $cpu.MaxClockSpeed
+	Metric 'ram_total_gb'     ([math]::Round($cs.TotalPhysicalMemory/1GB, 1))
+	Metric 'dimms_populated'  $dimms.Count
+	Metric 'dimm_slots'       $slots
+	Metric 'uptime_min'       ([math]::Round(((Get-Date) - $os.LastBootUpTime).TotalMinutes, 1))
+	Metric 'monitors'         ((Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | Measure-Object).Count)
+	Metric 'gpu_driver'       ((Get-CimInstance Win32_VideoController | Select-Object -First 1).DriverVersion)
+	if ($rel) { Metric 'reliability_index' ([math]::Round($rel.SystemStabilityIndex, 2)) }
+	if ($ws.WinSATAssessmentState -eq 1) {
+		Metric 'winsat_cpu' $ws.CPUScore; Metric 'winsat_mem' $ws.MemoryScore; Metric 'winsat_disk' $ws.DiskScore
+		Metric 'winsat_gfx' $ws.GraphicsScore; Metric 'winsat_d3d' $ws.D3DScore
+	}
 }
 
 Try-Run 'STORAGE' {
@@ -50,7 +76,7 @@ Try-Run 'STORAGE' {
 	if ($isAdmin) { Get-PhysicalDisk | Get-StorageReliabilityCounter | Select-Object DeviceId, Temperature, Wear, ReadErrorsTotal, WriteErrorsTotal, PowerOnHours | Format-Table -AutoSize | Out-String } else { '  (SMART/wear counters need elevation; CrystalDiskInfo shows the same data if installed)' }
 	if ($isAdmin) { Get-BitLockerVolume | ForEach-Object { "BitLocker $($_.MountPoint): $($_.VolumeStatus) $($_.EncryptionMethod)" } } else { '  (BitLocker status needs elevation)' }
 	'-- cold-cache sequential read (read-only; only meaningful within ~10 min of a cold boot, otherwise it measures RAM cache) --'
-	$targets = @("$env:WINDIR\System32\MRT.exe")
+	$targets = @("$env:WINDIR\System32\MRT.exe"); $readMbps = @()
 	$big = Get-ChildItem "$env:ProgramFiles" -Recurse -File -Depth 4 | Where-Object Length -gt 200MB | Sort-Object Length -Descending | Select-Object -First 1
 	if ($big) { $targets += $big.FullName }
 	foreach ($t in $targets) {
@@ -58,8 +84,15 @@ Try-Run 'STORAGE' {
 		$buf = New-Object byte[] (4MB); $fs = [IO.File]::Open($t, 'Open', 'Read', 'ReadWrite'); $sw = [Diagnostics.Stopwatch]::StartNew(); $tot = 0L
 		while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) { $tot += $n }
 		$sw.Stop(); $fs.Close()
-		"  {0,-70} {1,6:N0} MB  {2,6:N0} MB/s" -f (Trunc $t 70), ($tot/1MB), ($tot/1MB/$sw.Elapsed.TotalSeconds)
+		$mbps = $tot/1MB/$sw.Elapsed.TotalSeconds
+		"  {0,-70} {1,6:N0} MB  {2,6:N0} MB/s" -f (Trunc $t 70), ($tot/1MB), $mbps
+		$readMbps += [math]::Round($mbps)
 	}
+	Metric 'seq_read_mbps'      $readMbps
+	Metric 'seq_read_valid'     (((Get-Date) - $bootTime).TotalMinutes -lt 10)   # false = the figure is RAM cache, not the disk
+	Metric 'disks'              (Get-PhysicalDisk | ForEach-Object { "$($_.FriendlyName)=$($_.HealthStatus)" })
+	Metric 'volume_free_pct'    (Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | ForEach-Object { @{ drive = [string]$_.DriveLetter; free_pct = [math]::Round(100*$_.SizeRemaining/$_.Size); free_gb = [math]::Round($_.SizeRemaining/1GB) } })
+	if ($isAdmin) { Metric 'smart' (Get-PhysicalDisk | Get-StorageReliabilityCounter | ForEach-Object { @{ id = $_.DeviceId; temp_c = $_.Temperature; wear_pct = $_.Wear; read_err = $_.ReadErrorsTotal; write_err = $_.WriteErrorsTotal; power_on_hours = $_.PowerOnHours } }) }
 }
 
 Try-Run 'POWER' {
@@ -87,11 +120,19 @@ Try-Run 'POWER' {
 		if (Test-Path $rep) {
 			$b = ([xml](Get-Content $rep)).BatteryReport.Batteries.Battery
 			"Battery health: {0:N0}% of design ({1} / {2} mWh), {3} cycles" -f (100*[int]$b.FullChargeCapacity/[int]$b.DesignCapacity), $b.FullChargeCapacity, $b.DesignCapacity, $b.CycleCount
+			Metric 'battery_health_pct' ([math]::Round(100*[int]$b.FullChargeCapacity/[int]$b.DesignCapacity))
+			Metric 'battery_cycles'     ([int]$b.CycleCount)
 			[IO.File]::Delete($rep)
 		}
 	}
 	$pnp = Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match 'Dynamic Tuning Manager|Intelligent Thermal|AMD Ryzen Power|Thermal Framework' }
 	if ($pnp) { "OEM/Intel power-limit drivers present: " + (($pnp.FriendlyName | Sort-Object -Unique) -join '; ') }
+	Metric 'power_source'      $(if ($null -eq $ac) { 'AC (no battery)' } elseif ($ac) { 'AC' } else { 'BATTERY' })
+	Metric 'power_scheme'      (((powercfg /getactivescheme) -replace '.*\(([^)]+)\).*', '$1'))
+	Metric 'slider_ac'         $(if ($ov.ActiveOverlayAcPowerScheme -and $map[$ov.ActiveOverlayAcPowerScheme]) { $map[$ov.ActiveOverlayAcPowerScheme] } else { 'Balanced (default)' })
+	Metric 'slider_dc'         $(if ($ov.ActiveOverlayDcPowerScheme -and $map[$ov.ActiveOverlayDcPowerScheme]) { $map[$ov.ActiveOverlayDcPowerScheme] } else { 'Balanced (default)' })
+	Metric 'perfboost_override' $(if ($boost) { "AC=$($boost.ACSettingIndex) DC=$($boost.DCSettingIndex)" } else { 'none (turbo on)' })
+	Metric 'oem_power_drivers' $(if ($pnp) { @($pnp.FriendlyName | Sort-Object -Unique) } else { @() })
 	if ($isAdmin) { Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature | ForEach-Object { "Thermal zone: {0:N0} C" -f ($_.CurrentTemperature/10 - 273.15) } } else { '  (thermal zone temperatures need elevation)' }
 }
 
@@ -109,6 +150,18 @@ Try-Run 'LIVE LOAD (10 s sample)' {
 	$sys = $all | Where-Object { $_.Path -notmatch '\\process\(' } | Group-Object Path | ForEach-Object {
 		[pscustomobject]@{ Counter = ($_.Name -replace '^\\\\[^\\]+', ''); Min = [math]::Round(($_.Group.CookedValue | Measure-Object -Minimum).Minimum, 2); Avg = [math]::Round(($_.Group.CookedValue | Measure-Object -Average).Average, 2); Max = [math]::Round(($_.Group.CookedValue | Measure-Object -Maximum).Maximum, 2) } }
 	$sys | Format-Table -AutoSize | Out-String -Width 200
+	# Same samples the table above printed, keyed by short name for the JSON baseline.
+	$keyMap = @{
+		'% processor time'='cpu_pct'; '% privileged time'='cpu_privileged_pct'; '% interrupt time'='cpu_interrupt_pct'; '% dpc time'='cpu_dpc_pct'
+		'% of maximum frequency'='cpu_max_freq_pct'; 'processor frequency'='cpu_freq_mhz'; '% processor performance'='cpu_performance_pct'
+		'processor queue length'='cpu_queue_len'; 'context switches/sec'='context_switches_sec'
+		'available mbytes'='mem_available_mb'; 'pages/sec'='mem_pages_sec'; '% committed bytes in use'='mem_committed_pct'
+		'% idle time'='disk_idle_pct'; 'avg. disk queue length'='disk_queue_len'; 'avg. disk sec/read'='disk_sec_read'; 'avg. disk sec/write'='disk_sec_write'
+	}
+	foreach ($row in $sys) {
+		$leaf = ($row.Counter -split '\\')[-1]
+		if ($keyMap[$leaf]) { Metric $keyMap[$leaf] @{ min = $row.Min; avg = $row.Avg; max = $row.Max } }
+	}
 	'-- top CPU consumers (% of whole machine; this script itself is pwsh) --'
 	$all | Where-Object { $_.Path -match '\\process\(' -and $_.Path -match '% processor time' -and $_.InstanceName -notin '_total','idle' } | Group-Object InstanceName | ForEach-Object {
 		[pscustomobject]@{ Process = $_.Name; CPUpct = [math]::Round(($_.Group.CookedValue | Measure-Object -Average).Average / $n, 1) } } | Sort-Object CPUpct -Descending | Select-Object -First 10 | Format-Table -AutoSize | Out-String
@@ -122,6 +175,13 @@ Try-Run 'LIVE LOAD (10 s sample)' {
 	Get-CimInstance Win32_PageFileUsage | ForEach-Object { "Pagefile: $($_.Name) allocated=$($_.AllocatedBaseSize)MB used=$($_.CurrentUsage)MB peak=$($_.PeakUsage)MB" }
 	$p = Get-Process
 	"Processes: $($p.Count)  Threads: $(($p.Threads.Count | Measure-Object -Sum).Sum)  Handles: $(($p.Handles | Measure-Object -Sum).Sum)"
+	Metric 'gpu_3d_pct'    ([math]::Round((($g.CookedValue | Measure-Object -Sum).Sum), 1))
+	Metric 'commit_gb'     ([math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory)/1MB, 1))
+	Metric 'pagefile_used_mb' ((Get-CimInstance Win32_PageFileUsage | Measure-Object CurrentUsage -Sum).Sum)
+	Metric 'process_count' $p.Count
+	Metric 'thread_count'  (($p.Threads.Count | Measure-Object -Sum).Sum)
+	Metric 'handle_count'  (($p.Handles | Measure-Object -Sum).Sum)
+	Metric 'top_cpu'       ($all | Where-Object { $_.Path -match '\\process\(' -and $_.Path -match '% processor time' -and $_.InstanceName -notin '_total','idle' } | Group-Object InstanceName | ForEach-Object { @{ name = $_.Name; cpu_pct = [math]::Round(($_.Group.CookedValue | Measure-Object -Average).Average / $n, 1) } } | Sort-Object { -$_.cpu_pct } | Select-Object -First 10)
 }
 
 Try-Run 'PROCESSES' {
@@ -142,6 +202,13 @@ Try-Run 'PROCESSES' {
 	$wsl = wsl --list --running 2>$null | Where-Object { $_.Trim() -and $_ -notmatch 'no running|Windows Subsystem' }
 	[Console]::OutputEncoding = $prevEnc
 	"WSL distros running: " + $(if ($wsl) { ($wsl | ForEach-Object { $_.Trim() }) -join ', ' } else { 'none' })
+	Metric 'services_running'  ((Get-Service | Where-Object Status -eq Running | Measure-Object).Count)
+	Metric 'vbs_status'        $dg.VirtualizationBasedSecurityStatus
+	Metric 'vbs_services'      ($dg.SecurityServicesRunning -join ',')
+	Metric 'hypervisor_present' (Get-CimInstance Win32_ComputerSystem).HypervisorPresent
+	Metric 'webview2_count'    ((Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Measure-Object).Count)
+	Metric 'top_memory'        ($procs | Group-Object Name | ForEach-Object { @{ name = $_.Name; count = $_.Count; private_mb = [math]::Round(($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum/1MB) } } | Sort-Object { -$_.private_mb } | Select-Object -First 15)
+	Metric 'electron_apps'     ($procs | Where-Object { $_.Path -and (Test-Path -LiteralPath (Join-Path (Split-Path $_.Path) 'resources\app.asar')) } | Group-Object Name | ForEach-Object { @{ name = $_.Name; procs = $_.Count; ws_mb = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum/1MB) } })
 }
 
 Try-Run 'STARTUP' {
@@ -196,8 +263,25 @@ Try-Run 'SECURITY SOFTWARE' {
 	Get-Process | Where-Object { $_.Company -match 'Nord|Norton|McAfee|Avast|AVG|Kaspersky|Bitdefender|ESET|Malwarebytes|CrowdStrike|SentinelOne|Sophos' } | Group-Object Company | ForEach-Object { "3rd-party security/VPN processes: $($_.Name) x$($_.Count)" }
 	Get-CimInstance Win32_Service | Where-Object { $_.State -eq 'Running' -and $_.Name -match 'threatprotection|webfilter|nordsec' } | ForEach-Object { "VPN filter service running: $($_.Name) (filters traffic even with VPN disconnected)" }
 	Get-NetAdapter | Where-Object Status -eq Up | ForEach-Object { "Network up: $($_.Name) ($($_.InterfaceDescription)) $($_.LinkSpeed)" }
-	$dns = Measure-Command { Resolve-DnsName microsoft.com | Out-Null }; "DNS resolve: {0:N0} ms" -f $dns.TotalMilliseconds
+	# One lookup of one name measures a cold cache miss and the authoritative round trip, not the resolver:
+	# a single microsoft.com probe read 630 ms on a link whose warm lookups were 7-20 ms. Sample four names
+	# and report the median, so a slow first hop cannot masquerade as a DNS problem.
+	$dnsMs = foreach ($h in 'www.microsoft.com','github.com','www.google.com','cloudflare.com') {
+		[math]::Round((Measure-Command { Resolve-DnsName $h -Type A -ErrorAction SilentlyContinue | Out-Null }).TotalMilliseconds)
+	}
+	$dnsSorted = $dnsMs | Sort-Object; $dnsMedian = $dnsSorted[[int]($dnsSorted.Count/2)]
+	"DNS resolve: {0:N0} ms median of 4 ({1} ms)  -- judge on the median; the slowest is usually a cold cache miss" -f $dnsMedian, ($dnsMs -join ', ')
 	$ping = Test-Connection 1.1.1.1 -Count 3 | Measure-Object Latency -Average; if ($ping.Count) { "Ping 1.1.1.1: {0:N0} ms avg" -f $ping.Average }
+	$gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+	$gwPing = if ($gw) { (Test-Connection $gw -Count 3 -ErrorAction SilentlyContinue | Measure-Object Latency -Average).Average }
+	if ($gwPing) { "Ping gateway ${gw}: {0:N0} ms avg" -f $gwPing }
+	Metric 'av_product'        ((Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object { $_.displayName }) -join ', ')
+	Metric 'defender_realtime' $mp.RealTimeProtectionEnabled
+	Metric 'dns_median_ms'     $dnsMedian
+	Metric 'dns_samples_ms'    @($dnsMs)
+	Metric 'ping_internet_ms'  ([math]::Round($ping.Average, 1))
+	Metric 'ping_gateway_ms'   $(if ($gwPing) { [math]::Round($gwPing, 1) } else { $null })
+	Metric 'vpn_filter_services' @(Get-CimInstance Win32_Service | Where-Object { $_.State -eq 'Running' -and $_.Name -match 'threatprotection|webfilter|nordsec' } | ForEach-Object { $_.Name })
 }
 
 Try-Run 'UI SETTINGS' {
@@ -219,14 +303,16 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	$boots | ForEach-Object { if ($_.Message -match 'type was (0x\d)') { $Matches[1] } else { '?' } } | Group-Object | ForEach-Object { "  $($_.Name): $($_.Count) boot(s)" }
 	'-- Service Control Manager 7009 timeouts: REAL only if logged 45 s or more after the boot that preceded it; earlier means the process exited without connecting (log noise) --'
 	$svcByDisplay = @{}; Get-CimInstance Win32_Service | ForEach-Object { $svcByDisplay[$_.DisplayName] = $_ }
-	Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Service Control Manager'; Id=7009; StartTime=(Get-Date).AddDays(-30) } | ForEach-Object {
+	$e7009 = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Service Control Manager'; Id=7009; StartTime=(Get-Date).AddDays(-30) } | ForEach-Object {
 		$ev = $_
 		$disp = if ($ev.Message -match 'waiting for the (.+?) service to connect') { $Matches[1] } else { '?' }
 		$prevBoot = $boots | Where-Object { $_.TimeCreated -le $ev.TimeCreated } | Select-Object -Last 1
 		$tplus = if ($prevBoot) { [int]($ev.TimeCreated - $prevBoot.TimeCreated).TotalSeconds } else { -1 }
 		$svc = $svcByDisplay[$disp]
-		[pscustomobject]@{ Display = $disp; Tplus_s = $tplus; Verdict = $(if ($tplus -ge 0 -and $tplus -lt 45) { 'noise' } elseif ($tplus -ge 45) { 'REAL WAIT' } else { '?' }); Registered = $(if ($svc) { "$($svc.Name) start=$($svc.StartMode) state=$($svc.State)" } else { 'NOT REGISTERED (spawned by a driver/helper; correlate with Biometrics 1600, Kernel-PnP, vendor logs)' }) }
-	} | Group-Object Display, Verdict, Registered | ForEach-Object { "  x{0,-3} T+{1,4}s  {2,-9}  {3,-40} {4}" -f $_.Count, $_.Group[0].Tplus_s, $_.Group[0].Verdict, (Trunc $_.Group[0].Display 40), $_.Group[0].Registered }
+		[pscustomobject]@{ When = $ev.TimeCreated; Display = $disp; Tplus_s = $tplus; Verdict = $(if ($tplus -ge 0 -and $tplus -lt 45) { 'noise' } elseif ($tplus -ge 45) { 'REAL WAIT' } else { '?' }); Registered = $(if ($svc) { "$($svc.Name) start=$($svc.StartMode) state=$($svc.State)" } else { 'NOT REGISTERED (spawned by a driver/helper; correlate with Biometrics 1600, Kernel-PnP, vendor logs)' }) }
+	}
+	$e7009 | Group-Object Display, Verdict, Registered | ForEach-Object { "  x{0,-3} T+{1,4}s  {2,-9}  {3,-40} {4}" -f $_.Count, $_.Group[0].Tplus_s, $_.Group[0].Verdict, (Trunc $_.Group[0].Display 40), $_.Group[0].Registered }
+	if (-not $e7009) { '  none in 30 days' }
 	'-- Other Service Control Manager failures --'
 	Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Service Control Manager'; Id=7000,7011,7022,7023,7024,7031,7034; StartTime=$since } | ForEach-Object { [pscustomobject]@{ Id=$_.Id; Msg=(Trunc $_.Message 120) } } | Group-Object Id, Msg | Sort-Object Count -Descending | Select-Object -First 10 Count, @{n='Event';e={$_.Name}} | Format-Table -AutoSize | Out-String -Width 220
 	'-- Boot-start drivers that failed to load (7026): leftovers from uninstalled tools; map to the driver package with pnputil --'
@@ -252,7 +338,20 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	$hw = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='disk','storahci','stornvme','Ntfs','volmgr','Microsoft-Windows-WHEA-Logger','Microsoft-Windows-Kernel-Power'; Level=1,2,3; StartTime=(Get-Date).AddDays(-30) } | Group-Object ProviderName, Id
 	if ($hw) { $hw | ForEach-Object { "  x$($_.Count)  $($_.Name)" } } else { '  none' }
 	'-- Biometrics secure-component failures (1600): pairs with a SynaHlp-style 7009 from the fingerprint driver --'
-	"  " + ((Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Biometrics/Operational'; Id=1600; StartTime=(Get-Date).AddDays(-30) } | Measure-Object).Count) + " in 30 days"
+	$bio1600 = @(Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Biometrics/Operational'; Id=1600; StartTime=(Get-Date).AddDays(-30) })
+	"  $($bio1600.Count) in 30 days" + $(if ($bio1600) { "  (latest $(($bio1600 | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated))" })
+	# 1600 outliving its 7009 means the sensor was disabled and only the cosmetic log entry remains. Compare the
+	# newest of each: presence anywhere in the 30-day window proves nothing, because the window still holds the
+	# boots from before the fix. Count the cold boots since, so "it stopped" is backed by boots that would have shown it.
+	if ($bio1600) {
+		$newest1600 = ($bio1600 | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+		$newest7009 = ($e7009 | Where-Object { $_.Registered -match 'NOT REGISTERED' } | Sort-Object When -Descending | Select-Object -First 1).When
+		if (-not $newest7009) { '  (no unregistered-service 7009 in 30 days: 1600 alone is cosmetic log noise)' }
+		elseif ($newest1600 -gt $newest7009) {
+			$coldSince = @($boots | Where-Object { $_.TimeCreated -gt $newest7009 -and $_.Message -match 'type was 0x0' }).Count
+			"  (paired 7009 last seen $($newest7009.ToString('yyyy-MM-dd')), $coldSince cold boot(s) ago, while 1600 still fires: the service timeout has stopped and 1600 alone is cosmetic)"
+		}
+	}
 	'-- Processor power capability events (Id 55 is INFORMATIONAL, logged every boot; ignore) --'
 	Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Processor-Power'; StartTime=$since } | Group-Object Id | ForEach-Object { "  Id $($_.Name): $($_.Count)" }
 	'-- Resource exhaustion detector (2004, 30 days) --'
@@ -262,13 +361,40 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	$k0 = if ($kg) { $kg.TimeCreated } else { $bootTime }
 	$el = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='EventLog'; Id=6005; StartTime=$k0 } | Select-Object -First 1
 	$logon = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Shell-Core/Operational'; Id=62170; StartTime=$k0 } | Sort-Object TimeCreated | Select-Object -First 1
-	$lastApp = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Shell-Core/Operational'; Id=9708; StartTime=$k0 } | Sort-Object TimeCreated | Select-Object -Last 1
 	$gp = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-GroupPolicy'; Id=1502,1500; StartTime=$k0 } | Select-Object -First 1
-	$wl = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Winlogon'; Id=7001; StartTime=$k0 } | Sort-Object TimeCreated | Select-Object -First 1
+	$logons = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Winlogon'; Id=7001; StartTime=$k0 } | Sort-Object TimeCreated)
+	$wl = $logons | Select-Object -First 1
+	# A sign-out and second sign-in in the same boot produces a second burst of 9708s hours later. Spanning the
+	# first 7001 to the very last 9708 then reports a nonsense figure (14188s on the run that found this).
+	# Score each logon session against only the startup apps that ran before the next sign-in.
+	$appEnds = @(Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Shell-Core/Operational'; Id=9708; StartTime=$k0 } | Sort-Object TimeCreated)
+	$lastApp = $appEnds | Select-Object -Last 1
 	foreach ($m in @(@('kernel start', $k0), @('services (event log) up', $el.TimeCreated), @('group policy processed', $gp.TimeCreated), @('user signed in (Winlogon 7001)', $wl.TimeCreated), @('user logon tasks begin', $logon.TimeCreated), @('last startup app launched', $lastApp.TimeCreated)) | Where-Object { $_[1] } | Sort-Object { $_[1] }) {
 		"  T+{0,4}s  {1}" -f [int]($m[1] - $k0).TotalSeconds, $m[0]
 	}
-	if ($wl -and $lastApp) { "  sign-in to last startup app: {0}s  (judge startup cost on this; a large T+ at sign-in means the machine sat at the lock screen, not a slow boot)" -f [int]($lastApp.TimeCreated - $wl.TimeCreated).TotalSeconds }
+	$spans = @()
+	for ($i = 0; $i -lt $logons.Count; $i++) {
+		$start = $logons[$i].TimeCreated
+		$end   = if ($i + 1 -lt $logons.Count) { $logons[$i + 1].TimeCreated } else { [datetime]::MaxValue }
+		$last  = $appEnds | Where-Object { $_.TimeCreated -ge $start -and $_.TimeCreated -lt $end } | Select-Object -Last 1
+		if ($last) { $spans += [pscustomobject]@{ Session = $i + 1; SignInTplus = [int]($start - $k0).TotalSeconds; Seconds = [int]($last.TimeCreated - $start).TotalSeconds } }
+	}
+	if ($logons.Count -gt 1) { "  ($($logons.Count) sign-ins this boot; each scored separately against its own startup apps)" }
+	foreach ($s in $spans) { "  sign-in #{0} (at T+{1}s) to its last startup app: {2}s  (judge startup cost on this, healthy under 60 s; a large T+ at sign-in means the machine sat at the lock screen, not a slow boot)" -f $s.Session, $s.SignInTplus, $s.Seconds }
+	Metric 'boot_type_counts'   ($boots | ForEach-Object { if ($_.Message -match 'type was (0x\d)') { $Matches[1] } else { '?' } } | Group-Object | ForEach-Object { @{ type = $_.Name; count = $_.Count } })
+	Metric 'ev_7009_real'       (@($e7009 | Where-Object Verdict -eq 'REAL WAIT').Count)
+	Metric 'ev_7009_noise'      (@($e7009 | Where-Object Verdict -eq 'noise').Count)
+	Metric 'ev_7026_this_boot'  $(if ($e7026 -and $e7026.TimeCreated -gt $bootTime.AddMinutes(-5)) { 1 } else { 0 })
+	Metric 'ev_biometrics_1600' $bio1600.Count
+	Metric 'ev_sys_errors_7d'   ((Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=$since } | Measure-Object).Count)
+	Metric 'ev_app_crashes_7d'  ((Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000; StartTime=$since } | Measure-Object).Count)
+	Metric 'ev_app_hangs_7d'    ((Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1002; StartTime=$since } | Measure-Object).Count)
+	Metric 'ev_hw_warnings_30d' (@($hw | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum)
+	Metric 'ev_resource_exhaustion_30d' ((Get-WinEvent -FilterHashtable @{ LogName='System'; Id=2004; ProviderName='Microsoft-Windows-Resource-Exhaustion-Detector'; StartTime=(Get-Date).AddDays(-30) } | Measure-Object).Count)
+	Metric 'boot_services_up_s' $(if ($el) { [int]($el.TimeCreated - $k0).TotalSeconds } else { $null })
+	Metric 'boot_signin_s'      $(if ($wl) { [int]($wl.TimeCreated - $k0).TotalSeconds } else { $null })
+	Metric 'logon_sessions'     $logons.Count
+	Metric 'startup_spans_s'    @($spans | ForEach-Object { @{ session = $_.Session; signin_tplus_s = $_.SignInTplus; seconds = $_.Seconds } })
 	if ($isAdmin) {
 		'-- Boot duration (Diagnostics-Performance 100; the log is often empty even when elevated) --'
 		$bp = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=100 } -MaxEvents 5
@@ -285,20 +411,82 @@ Try-Run 'WINDOWS UPDATE' {
 	if ($CheckUpdates) {
 		$r = $srch.Search('IsInstalled=0 and IsHidden=0')
 		"Pending updates: $($r.Updates.Count)"; $r.Updates | ForEach-Object { "  - $($_.Title)" }
+		Metric 'pending_updates'       $r.Updates.Count
+		Metric 'pending_update_titles' @($r.Updates | ForEach-Object { $_.Title })
 	} else { '  (re-run with -CheckUpdates to search for pending updates; adds ~30 s)' }
+	Metric 'pending_reboot' (
+		(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+		(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
+	Metric 'wu_recent_failures' ((Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; Id=20; StartTime=(Get-Date).AddDays(-7) } | Measure-Object).Count)
 }
 
 Try-Run 'DISK HYGIENE' {
+	$hyg = @{}
 	foreach ($d in $env:TEMP, 'C:\Windows\Temp', 'C:\Windows\SoftwareDistribution\Download', 'C:\Windows\Logs\CBS', 'C:\$Recycle.Bin', 'C:\Windows\Minidump') {
 		if (-not (Test-Path -LiteralPath $d)) { continue }
 		$s = (Get-ChildItem -LiteralPath $d -Recurse -Force | Measure-Object Length -Sum).Sum
 		"  {0,-50} {1,8:N0} MB" -f $d, ($s/1MB)
+		$hyg[$d] = [math]::Round($s/1MB)
 	}
+	Metric 'temp_folder_mb' $hyg
+	Metric 'pagefile_gb'    ([math]::Round(((Get-ChildItem C:\ -Force | Where-Object Name -eq 'pagefile.sys').Length)/1GB, 1))
+	Metric 'hiberfil_gb'    ([math]::Round(((Get-ChildItem C:\ -Force | Where-Object Name -eq 'hiberfil.sys').Length)/1GB, 1))
 	$low = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne 'C' -and $_.Size -gt 0 -and ($_.SizeRemaining / $_.Size) -lt 0.15 }
 	foreach ($v in $low) {
 		"  -- $($v.DriveLetter): is under 15% free; largest top-level folders --"
 		Get-ChildItem "$($v.DriveLetter):\" -Directory -Force | ForEach-Object { [pscustomobject]@{ Folder = $_.Name; GB = [math]::Round(((Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force | Measure-Object Length -Sum).Sum)/1GB, 1) } } | Sort-Object GB -Descending | Select-Object -First 8 | ForEach-Object { "     {0,-45} {1,7:N1} GB" -f $_.Folder, $_.GB }
 	}
+}
+
+Try-Run 'METRICS BASELINE (JSON)' {
+	if ($NoJson) { '  (-NoJson: no metrics file written)'; return }
+	$dir = if ($JsonOut) { Split-Path -Parent $JsonOut } else { $env:TEMP }
+	if (-not $dir) { $dir = $env:TEMP }
+	$path = if ($JsonOut) { $JsonOut } else { Join-Path $env:TEMP ('win-diag-metrics_{0}.json' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss')) }
+
+	# Compare against the newest earlier baseline before writing this one, so the delta is run-over-run.
+	$prior = Get-ChildItem (Join-Path $dir 'win-diag-metrics_*.json') | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+	$doc = [ordered]@{
+		schema       = 'win-diag-metrics/1'
+		collected_at = (Get-Date).ToString('o')
+		hostname     = $env:COMPUTERNAME
+		elevated     = $isAdmin
+		boot_time    = $bootTime.ToString('o')
+		checked_updates = [bool]$CheckUpdates
+		metrics      = $script:M
+	}
+	$doc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding utf8
+	"  written: $path"
+
+	if (-not $prior) { '  (no earlier baseline in this folder; this run is the reference for the next one)'; return }
+	"  comparing against: $($prior.Name)  ($([int]((Get-Date) - $prior.LastWriteTime).TotalHours) h ago)"
+	$old = (Get-Content -LiteralPath $prior.FullName -Raw | ConvertFrom-Json).metrics
+	# Only the scalar KPIs worth tracking. Direction says which way is bad, so a regression is obvious at a glance.
+	$track = [ordered]@{
+		'cpu_pct'            = 'lower'; 'cpu_privileged_pct' = 'lower'; 'cpu_queue_len'     = 'lower'
+		'cpu_performance_pct'= 'higher'; 'cpu_max_freq_pct'  = 'higher'; 'cpu_freq_mhz'     = 'higher'
+		'mem_available_mb'   = 'higher'; 'mem_pages_sec'     = 'lower';  'mem_committed_pct'= 'lower'
+		'disk_idle_pct'      = 'higher'; 'disk_queue_len'    = 'lower';  'disk_sec_read'    = 'lower'; 'disk_sec_write' = 'lower'
+		'process_count'      = 'lower';  'thread_count'      = 'lower';  'handle_count'     = 'lower'; 'services_running' = 'lower'
+		'reliability_index'  = 'higher'; 'dns_median_ms'     = 'lower';  'ping_internet_ms' = 'lower'
+		'battery_health_pct' = 'higher'; 'commit_gb'         = 'lower';  'gpu_3d_pct'       = 'lower'
+		'ev_7009_real'       = 'lower';  'ev_app_crashes_7d' = 'lower';  'ev_app_hangs_7d'  = 'lower'
+		'ev_sys_errors_7d'   = 'lower';  'ev_hw_warnings_30d'= 'lower';  'ev_resource_exhaustion_30d' = 'lower'
+	}
+	$rows = foreach ($k in $track.Keys) {
+		$nv = $script:M[$k]; $ov = $old.$k
+		# Counter metrics are {min,avg,max}; compare the average.
+		if ($nv -is [hashtable]) { $nv = $nv.avg }
+		if ($ov -and $ov.PSObject.Properties.Name -contains 'avg') { $ov = $ov.avg }
+		if ($null -eq $nv -or $null -eq $ov) { continue }
+		$d = [math]::Round([double]$nv - [double]$ov, 2)
+		$flag = if ($d -eq 0) { '' } elseif (($track[$k] -eq 'lower' -and $d -gt 0) -or ($track[$k] -eq 'higher' -and $d -lt 0)) { 'WORSE' } else { 'better' }
+		[pscustomobject]@{ Metric = $k; Previous = $ov; Now = $nv; Delta = $d; Change = $flag }
+	}
+	$rows | Format-Table -AutoSize | Out-String -Width 120
+	'  A WORSE flag is only a regression if the two runs were in comparable states: check uptime_min, power_source'
+	'  and whether a scan or updater was running in top_cpu on either run before calling it one.'
 }
 
 ''

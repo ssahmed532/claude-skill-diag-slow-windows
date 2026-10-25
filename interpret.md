@@ -17,7 +17,7 @@ Users often ask "is it slow?" rather than "why is it slow?". Answer that first w
 | Cold-cache sequential read | over 1000 MB/s NVMe, over 400 MB/s SATA SSD, 100 to 150 MB/s HDD |
 | Boot milestones | logon tasks begin under 30 s, last startup app under 90 s |
 | WinSAT scores | 8 or above on every line (max 9.9) |
-| DNS resolve / ping | under 100 ms / under 30 ms |
+| DNS resolve / ping | median under 100 ms / under 30 ms |
 | Reliability index | trending upward; below 5 means frequent crashes |
 
 Say plainly which of these passed. Then list the causes that are still worth fixing, ranked.
@@ -88,6 +88,7 @@ Then say: a reboot is needed; the ACPI node may reappear as an unknown device an
 - The Diagnostics-Performance log (Id 100) is frequently empty even when elevated. Use the milestone list instead: Kernel-General 12 (kernel start) to Shell-Core 62170 (logon tasks begin) is the OS boot; the last Shell-Core 9708 is when the final Run-key app launched. On a healthy NVMe laptop these are about 18 s and 70 s.
 - Group Policy 1502 at T+80 s on a non-domain machine is the local policy object being processed and is normal.
 - Milestones are measured from kernel start, so "user logon tasks begin" and "last startup app launched" include however long the machine sat at the lock screen. The script prints Winlogon 7001 (user signed in) and the sign-in-to-last-app span; judge startup cost on that span (healthy under 60 s), not on the raw T+. A logon at T+600 s with no Kernel-Power 42/107 in between is a user who walked away, not a slow boot.
+- **One boot can contain several sign-ins.** A sign-out (Winlogon 7002) and a later sign-in replay the whole Run-key set, so the 9707/9708 timeline shows a second burst hours into the boot. The script now scores each 7001 against only the startup apps that ran before the next 7001 and prints one span per session; before that fix it spanned the first sign-in to the very last app and reported 14188 s on a machine whose real startup cost was 72 s. If two spans are printed, the later one is usually the faster of the two because the caches are warm — quote the first for cold-start cost.
 - The 9707/9708 list shows what each startup entry cost. Edge's `setup.exe --msedge --delete-old-versions` running 8 s at logon is the Edge updater cleaning up after an update, transient.
 
 ## PROCESSES and STARTUP: permanent background load
@@ -133,6 +134,12 @@ Phone Link is `Microsoft.YourPhone`. Also turn off Settings > Bluetooth and devi
 - Temp folders above a few GB are worth clearing; a few hundred MB is normal. Recycle Bin at several GB and a 12 GB hiberfil are cosmetic unless C: is tight.
 - Volsnap 36 with System Restore off (`RPSessionInterval` 0) means some other tool takes shadow copies that hit their quota. Not a disk fault.
 
+## NETWORK
+
+- The script resolves four names and prints the **median** plus all four samples. Judge on the median. A single cold lookup routinely reads several hundred ms while the link is fine: one run measured 630 ms for `microsoft.com` on a connection whose warm lookups were 7 to 20 ms and whose gateway ping was 1.3 ms. Only call DNS slow when the median is over 100 ms.
+- Gateway ping separates the link from the resolver. Gateway under 5 ms with a high DNS median points at the resolver or a VPN filter; gateway itself high points at Wi-Fi.
+- A VPN "threat protection" filter adds a hop to every lookup. Suspect it only when the median is genuinely high, not on the strength of one slow sample.
+
 ## SECURITY SOFTWARE
 
 - Windows Defender resident at 300 to 500 MB is normal. Do not recommend disabling it. "Full scan never" is fine; quick scans cover it.
@@ -161,6 +168,7 @@ Transparency on, VisualFXSetting "best appearance" or "let Windows choose", and 
 - DeviceAssociationService 3502 unpairing failures are Bluetooth housekeeping.
 - Service Control Manager 7023 "Phone Service terminated: a system shutdown is in progress" is shutdown ordering, not a fault.
 - Intel TPM Provisioning Service 7009 at every cold boot is benign (see the 7009 section).
+- Biometrics 1600 keeps firing after the fingerprint sensor is disabled. The Windows Biometric service still probes the secure component at every boot and logs the failure at about T+15 s; nothing waits on it. Check whether the paired SCM 7009 stopped — that is the signal the disable worked. A 1600 count with no recent 7009 is cosmetic log noise, not a regression.
 
 ## Transient vs permanent
 
@@ -180,6 +188,18 @@ Get-Content "$sp\fix.txt"
 ```
 
 One UAC prompt per script, so batch the inspection and the change into as few scripts as possible, but keep the read-only inspection separate from the change so the target is seen before it is touched. Print a BEFORE and AFTER state in the fix script. Tell the user a prompt is coming.
+
+## METRICS BASELINE: comparing runs
+
+Every run writes `%TEMP%\win-diag-metrics_<yyyy-MM-dd_HHmmss>.json` (schema `win-diag-metrics/1`) holding the same figures the text report printed, and prints a delta table against the newest earlier file in that folder. `-JsonOut <path>` moves it, `-NoJson` suppresses it.
+
+Read the delta table with the run conditions in hand; a WORSE flag is not a regression on its own:
+
+- **Compare like with like.** `uptime_min`, `power_source` and the `top_cpu` list decide whether two runs are comparable. A run taken 5 minutes after boot with the indexer rebuilding will lose to one taken at idle on every CPU and disk line, and neither run is wrong.
+- **Noisy by nature:** `cpu_pct`, `cpu_freq_mhz`, `cpu_performance_pct`, `mem_pages_sec`, `gpu_3d_pct`, `dns_median_ms`. These are 10-second samples of a live machine; swings of tens of percent between runs are normal. Only a trend across several files is evidence.
+- **Stable, so a real signal when they move:** `process_count`, `services_running`, `reliability_index`, `battery_health_pct`, `dimms_populated`, `winsat_*`, `volume_free_pct`. A jump in `process_count` or `services_running` means something new is installed and resident; a falling `reliability_index` means new crashes.
+- `seq_read_valid` false means `seq_read_mbps` measured RAM cache, not the disk. Do not compare those numbers across runs unless both say true.
+- To force a comparable pair, run both at the same point: a few minutes after a cold boot, on AC, with nothing open.
 
 ## Report template
 

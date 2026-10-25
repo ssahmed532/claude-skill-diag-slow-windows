@@ -17,6 +17,8 @@ pwsh -NoProfile -File "$env:USERPROFILE\.claude\skills\diag-slow-windows\diagnos
 
 Redirect the output to a file in the scratchpad and Read it in sections; it is long. Do not re-implement the checks ad hoc; if the script needs a new check, add it to the script so the next run has it too. If the machine booted more than 10 minutes ago, say the cold-cache read figure measures RAM cache, not the disk.
 
+Every run also writes `%TEMP%\win-diag-metrics_<yyyy-MM-dd_HHmmss>.json` holding the measured KPIs, and prints a delta table against the newest earlier file there, so regressions show up run over run. `-JsonOut <path>` moves the file, `-NoJson` suppresses it. Interpret that table with the "METRICS BASELINE" section of `interpret.md`: the CPU, DNS and GPU figures are noisy 10-second samples, and a WORSE flag counts only when the two runs were taken in comparable states (check `uptime_min`, `power_source`, `top_cpu`).
+
 ## Step 2: interpret
 
 Read `interpret.md` in this skill folder. It holds the healthy-range table, the thresholds, the traps (events that look alarming but are not), and the remediation commands for each finding. Judge each finding against those thresholds rather than against instinct.
