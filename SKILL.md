@@ -3,6 +3,8 @@ name: diag-slow-windows
 description: Custom, bespoke Claude Skill to diagnose a slow Windows 11 installation. Decides whether the machine is actually slow and, if so, why. Runs a read-only PowerShell diagnostic (power limits, CPU clocks, boot types and boot timeline, Service Control Manager 7009 and 7026 analysis, background app load, VBS, RAM channels, disk health and cold-cache read speed, startup entries, shell extensions, drivers and biometrics, event log) and produces a verdict plus a ranked list of causes with exact remediation commands. Use whenever the system feels slow, boots slowly, or the UI lags.
 disable-model-invocation: true
 allowed-tools: PowerShell Bash Read
+metadata:
+  version: 1.0.0
 ---
 
 Decide whether this Windows 11 machine is slow and why. Analyse only; make no changes unless the user asks afterwards.

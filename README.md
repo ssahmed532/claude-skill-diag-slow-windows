@@ -49,6 +49,14 @@ pwsh -NoProfile -File .\diagnose.ps1
 pwsh -NoProfile -File .\diagnose.ps1 -CheckUpdates
 ```
 
+## Versioning
+
+The skill follows [Semantic Versioning](https://semver.org). The current version is in the `metadata.version` field of `SKILL.md`, and each release is tagged `vX.Y.Z`.
+
+- **Major**: a change that breaks existing use: a `diagnose.ps1` parameter removed or renamed, an incompatible change to the metrics JSON (which also bumps its `schema`), a renamed skill, or the script making changes to the machine.
+- **Minor**: a backward-compatible addition: a new check, parameter, metric or interpretation section.
+- **Patch**: a fix that adds nothing: a measurement or threshold corrected, a misleading reading fixed, a documentation correction.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
