@@ -1,0 +1,124 @@
+{
+	"device": "Lenovo ThinkPad E15 Gen 2",
+	"windows": "Windows 11 Pro 25H2 (OS build 26200.9711)",
+	"scanned": "2026-10-25 19:13",
+	"skill_version": "1.2.0",
+	"scope": "full scan",
+	"elevation": "approved",
+	"baseline": "win-diag-metrics_2026-10-25_191335.json",
+	"intro": "Is this laptop slow, and if so why? Measured at idle on AC power, 5.9 hours after a cold boot. Nothing on the machine was changed.",
+	"meta": [
+		{ "label": "Hardware", "value": "i7-1165G7 · 4 cores / 8 threads · 32 GB single-channel · 2× NVMe" },
+		{ "label": "BIOS", "value": "R1EET67W 1.67 (Apr 2026)" }
+	],
+	"verdict": {
+		"label": "Not slow",
+		"status": "good",
+		"text": "11 of the 12 healthy-range checks pass at idle. The one that fails is **stability**: the reliability index is 4.38 and falling, because Store app updates and a Lenovo updater keep failing. Everything below is tuning and housekeeping, not a fault."
+	},
+	"tiles": [
+		{ "value": "7.1", "unit": "%", "label": "CPU busy, 10 s average" },
+		{ "value": "23.9", "unit": " GB", "label": "RAM available of 31.7" },
+		{ "value": "83", "unit": " s", "label": "Last boot, start to settled" },
+		{ "value": "4.38", "unit": " / 10", "label": "Reliability index (falling)", "status": "bad" }
+	],
+	"checks": [
+		{ "check": "CPU busy (% Processor Time)", "measured": "7.1% avg, 16% peak", "healthy": "under 20%", "result": "pass" },
+		{ "check": "Turbo (% Processor Performance)", "measured": "78.9% avg, 137.6% peak", "healthy": "peaks over 100% = turbo works", "result": "pass" },
+		{ "check": "Disk health (elevated)", "measured": "both NVMe Healthy · 0% wear · 48 °C / 34 °C", "healthy": "Healthy, wear under 90%", "result": "pass" },
+		{ "check": "Cold-cache disk read", "measured": "5,085 MB/s, but RAM cache (booted 5.9 h ago)", "healthy": "over 1,000 MB/s, within 10 min of boot", "result": "na", "result_label": "not valid" },
+		{ "check": "Reliability index", "measured": "4.38 now · 4.74 a week ago · 4.87 a month ago", "healthy": "5 or above, trending up", "result": "fail" }
+	],
+	"charts": [
+		{
+			"kind": "bars",
+			"title": "Failures that lowered reliability, last 30 days",
+			"stats": [
+				{ "value": "4.87", "label": "30 days ago" },
+				{ "value": "4.74", "label": "7 days ago" },
+				{ "value": "4.38", "label": "now", "status": "bad" }
+			],
+			"rows": [
+				{ "label": "Codex Store update failed", "value": 14, "hint": "WindowsUpdateClient 20, error 0x80073D02" },
+				{ "label": "Lenovo fwdetect crash", "value": 12, "hint": "Application Error 1000, exception 0xe0434352" },
+				{ "label": "Terminal Store update failed", "value": 3 }
+			],
+			"note": "Error 0x80073D02 means the app was open when the Store tried to replace it."
+		},
+		{
+			"kind": "bars",
+			"title": "Startup app cost, this boot",
+			"subtitle": "Seconds from launch to ready, per Run-key entry",
+			"legend": [
+				{ "label": "Runs every sign-in", "tone": "series1" },
+				{ "label": "One-off (Edge updater)", "tone": "muted" }
+			],
+			"rows": [
+				{ "label": "Google Drive", "value": 21.4, "display": "21.4 s", "hint": "Started at T+36 s" },
+				{ "label": "Edge setup.exe cleanup", "value": 9.6, "display": "9.6 s", "tone": "muted" },
+				{ "label": "Discord", "value": 3.6, "display": "3.6 s" }
+			]
+		},
+		{
+			"kind": "stacked",
+			"title": "Boot duration, last logged boots",
+			"subtitle": "Diagnostics-Performance 100, elevated checks only",
+			"unit": "s",
+			"legend": [
+				{ "label": "Main path (to desktop)", "tone": "series1" },
+				{ "label": "Post-boot (startup apps settle)", "tone": "series2" }
+			],
+			"rows": [
+				{ "label": "Oct 7", "parts": [19, 83], "display": "101 s" },
+				{ "label": "Oct 25 (this boot)", "parts": [21, 62], "display": "83 s" }
+			]
+		},
+		{
+			"kind": "table",
+			"title": "Change since the previous run",
+			"subtitle": "Same boot and power source, so comparable",
+			"columns": ["Metric", "Before", "Now", "Reading"],
+			"rows": [
+				["CPU busy", "9.5%", "7.1%", "noise"],
+				["Reliability", "4.32", "4.38", "slow recovery"]
+			]
+		}
+	],
+	"findings_intro": "None of these is a fault. Each is background work or a stability cost, most noticeable first.",
+	"findings": [
+		{
+			"title": "Power mode is Balanced while plugged in",
+			"impact": "medium",
+			"evidence": "The slider is **Balanced** on AC. Lenovo Intelligent Thermal Solution sets the CPU power limits from it. Prove it: switch to Best performance, run a heavy task and compare `% Processor Performance`.",
+			"fix": {
+				"label": "no admin · reversible",
+				"commands": ["powercfg /overlaysetactive overlay_scheme_max"],
+				"text": "Or **Settings › System › Power & battery › Power mode › Best performance**. To undo, run `powercfg /overlaysetactive overlay_scheme_balanced`."
+			}
+		},
+		{
+			"title": "Leftover startup entries",
+			"impact": "cleanup",
+			"impact_label": "cleanup only",
+			"evidence": "**Logitech Download Assistant** has a Task Manager approval entry and no program behind it.",
+			"fix": {
+				"admin": true,
+				"commands": ["Remove-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run' -Name 'Logitech Download Assistant'"]
+			}
+		}
+	],
+	"plan": [
+		{ "text": "Set power mode to Best performance while on AC.", "why": "Raises the CPU's sustained power limit.", "tag": "no admin · 10 s" },
+		{ "text": "Remove the leftover startup entry.", "tag": "admin" }
+	],
+	"fine": [
+		"**Boot:** no service timeouts (7009) and no failed boot drivers (7026) in 30 days.",
+		"**Disks:** both NVMe drives Healthy, 0% wear, TRIM on."
+	],
+	"fixed": [
+		"**Single-channel RAM:** the board has one memory slot."
+	],
+	"unmeasured": [
+		"**Cold-cache disk speed:** the machine had been up 5.9 hours, so the read test measured RAM cache."
+	]
+}

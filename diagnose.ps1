@@ -30,9 +30,18 @@ Try-Run 'HARDWARE' {
 	$cs  = Get-CimInstance Win32_ComputerSystem
 	$cpu = Get-CimInstance Win32_Processor
 	$bios = Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS'
+	$cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+	# The report artifact is titled with $device. Lenovo keeps the marketing name in SystemFamily and a part number
+	# in Model; other makers put the marketing name in Model, sometimes already prefixed with the make.
+	$make = switch -Regex ($cs.Manufacturer) { '^LENOVO' { 'Lenovo' } '^Dell' { 'Dell' } '^(HP|Hewlett)' { 'HP' } '^ASUS' { 'ASUS' } '^Micro-Star' { 'MSI' } '^Microsoft' { 'Microsoft' } '^Acer' { 'Acer' } '^Samsung' { 'Samsung' } '^Gigabyte' { 'Gigabyte' } default { ($cs.Manufacturer -replace ',?\s+(Inc\.?|Corporation|Corp\.?|Co\.,? Ltd\.?|Ltd\.?)$', '').Trim() } }
+	$product = if ($make -eq 'Lenovo' -and $bios.SystemFamily) { $bios.SystemFamily } else { $cs.Model }
+	$device = if (-not $product -or $product -match '^(System Product Name|To Be Filled By O\.E\.M\.|Default string)$') { "$make PC" } elseif ($product -like "$make *") { $product } else { "$make $product" }
+	# CurrentVersion\ProductName still says "Windows 10" on Windows 11, so the edition comes from Caption.
+	$winName = "$($os.Caption -replace '^Microsoft ', '') $($cv.DisplayVersion) (OS build $($cv.CurrentBuild).$($cv.UBR))"
+	"Device:   $device"
 	"Model:    $($cs.Manufacturer) $($cs.Model)  ($($bios.SystemFamily))"
 	"BIOS:     $($bios.BIOSVersion)  released $($bios.BIOSReleaseDate)"
-	"OS:       $($os.Caption) $($os.Version) $($os.OSArchitecture)  installed $($os.InstallDate.ToString('yyyy-MM-dd'))"
+	"OS:       $winName $($os.OSArchitecture)  installed $($os.InstallDate.ToString('yyyy-MM-dd'))"
 	"CPU:      $($cpu.Name)  cores=$($cpu.NumberOfCores) threads=$($cpu.NumberOfLogicalProcessors) baseMHz=$($cpu.MaxClockSpeed)"
 	"RAM:      {0:N1} GB total, {1:N1} GB free" -f ($cs.TotalPhysicalMemory/1GB), ($os.FreePhysicalMemory/1MB)
 	$dimms = Get-CimInstance Win32_PhysicalMemory
@@ -59,6 +68,8 @@ Try-Run 'HARDWARE' {
 	$ws = Get-CimInstance Win32_WinSAT
 	if ($ws.WinSATAssessmentState -eq 1) { "WinSAT:   cpu=$($ws.CPUScore) mem=$($ws.MemoryScore) disk=$($ws.DiskScore) gfx=$($ws.GraphicsScore) d3d=$($ws.D3DScore) (max 9.9)" }
 	Metric 'model'            "$($cs.Manufacturer) $($cs.Model)"
+	Metric 'device_name'      $device
+	Metric 'windows'          $winName
 	Metric 'bios'             ([string]$bios.BIOSVersion)
 	Metric 'os_build'         $os.Version
 	Metric 'cpu'              $cpu.Name

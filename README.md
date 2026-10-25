@@ -4,6 +4,8 @@ A [Claude Code](https://claude.com/claude-code) skill that decides whether a Win
 
 It runs a read-only PowerShell diagnostic and then interprets the output against a table of healthy ranges, a list of known event-log traps, and a set of ranked remediations. The result is a verdict first, then the causes that matter, each with a copy-pasteable fix.
 
+Each run publishes the result as a new Claude artifact titled "<make model> Performance and Health Report", for example "Lenovo ThinkPad E15 Gen 2 Performance and Health Report". Every report uses the same template. It shows the exact Windows edition, version and build at the time of the run, the verdict, the healthy-range table, charts of the evidence, the ranked findings with their fixes, and the recommended order of work.
+
 ## What the script checks
 
 - CPU clock vs nominal, power source, power mode slider, OEM power-limit drivers
@@ -16,7 +18,21 @@ It runs a read-only PowerShell diagnostic and then interprets the output against
 - Shell extensions, devices with problems, biometric sensors and whether anyone is enrolled
 - Security software, DNS and ping latency, UI effects, Windows Update history, temp folders
 
-The script makes no changes. Elevation is optional; without it, SMART counters, BitLocker, thermal zones and the boot-duration log are skipped and the script says so.
+The script makes no changes.
+
+## The UAC prompt
+
+Before the diagnostic starts, Claude tells you that a Windows **User Account Control (UAC) prompt** is about to appear, asking to run PowerShell as administrator. The script stays read-only either way. Approving the prompt adds the checks that Windows only allows an elevated process to make:
+
+| Elevated check | What it adds to the report |
+|---|---|
+| Disk SMART and wear counters | Drive temperature, wear percentage, read and write error totals, and power-on hours for each physical disk |
+| BitLocker status | Whether each volume is encrypted, and with which method |
+| ACPI thermal zones | Temperatures from the firmware's thermal zones, on machines that report them to Windows |
+| Boot-duration history | Total, main-path and post-boot seconds for recent boots (Diagnostics-Performance event 100), so a boot-time trend can be charted |
+| System-wide scheduled tasks | Third-party tasks registered for the whole machine (OEM updaters, browser updaters) that a standard user cannot list |
+
+If you deny the prompt, or leave it unanswered for 2 minutes, the diagnostic runs as your standard user instead. The report then says that the elevated checks were skipped. Every other check still runs. Windows cannot withdraw a UAC prompt, so after a timeout it stays on screen. Click No; approving it late runs nothing. To skip the prompt from the start, ask for a run with no elevation (`/diag-slow-windows no elevation`). If Claude Code is already running elevated, no prompt appears.
 
 ## Install
 
@@ -40,13 +56,18 @@ Requires PowerShell 7 (`pwsh`).
 |---|---|
 | `SKILL.md` | The skill definition: steps, reporting rules, argument handling |
 | `diagnose.ps1` | The read-only diagnostic script |
+| `run-diagnostics.ps1` | Launcher: asks for elevation through UAC, waits up to 2 minutes, and falls back to a standard run |
 | `interpret.md` | Healthy-range table, thresholds, event-log traps, remediation commands, and how to run an elevated fix |
+| `report-template.html` | The report artifact template, the same for every run |
+| `build-report.ps1` | Fills the template with one run's report data and sets the title |
+| `report-sample.json` | Example report data showing every field the template reads |
 
 ## Running the script on its own
 
 ```powershell
 pwsh -NoProfile -File .\diagnose.ps1
 pwsh -NoProfile -File .\diagnose.ps1 -CheckUpdates
+pwsh -NoProfile -File .\run-diagnostics.ps1 -OutDir $env:TEMP -CheckUpdates    # with the UAC prompt
 ```
 
 ## Versioning
