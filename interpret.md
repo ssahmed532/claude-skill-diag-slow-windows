@@ -11,7 +11,7 @@ Users often ask "is it slow?" rather than "why is it slow?". Answer that first w
 | `% Processor Time` | under 20% (pwsh running the script accounts for a few points) |
 | `% Processor Performance` | over 100% means turbo is working; under 80% under load means clamped |
 | `Processor Queue Length` | under 2 |
-| RAM used | under 80%, pagefile usage 0%, `Pages/sec` under 50 |
+| RAM used | under 80%, pagefile usage 0%; `Pages/sec` matters only above 100 sustained with low Available MBytes (it also counts memory-mapped file reads, so a torrent client or indexer can push it into the hundreds with RAM to spare) |
 | `PhysicalDisk % Idle Time` | over 90% |
 | `Avg. Disk sec/Read` / `sec/Write` | under 0.010 on NVMe, under 0.020 on SATA SSD |
 | Cold-cache sequential read | over 1000 MB/s NVMe, over 400 MB/s SATA SSD, 100 to 150 MB/s HDD |
@@ -102,7 +102,13 @@ Scale everything against the core count. Four cores at 1.5 GHz cannot hide what 
 - RGB, mouse, audio and printer vendor helpers (iCUE, Logitech, Razer, Realtek tasks) belong on desktops, rarely on laptops.
 - OEM helper crashing repeatedly (Lenovo `UDClientService` faulting in ucrtbase) means run the OEM update tool; do not disable it.
 
-Startup approval state: 02 is enabled, 03 is disabled. An entry in StartupApproved with no matching Run key, process, service or uninstall record is a stale ghost. Remove the value from the StartupApproved key (admin for HKLM) and it disappears from Task Manager.
+Startup approval state: an even first byte is enabled (02, and 06 as on SecurityHealth), an odd one disabled (03). The script prints the hive of each entry and marks it STALE when no Run key or Startup-folder item has that name. Confirm there is also no matching process, service or uninstall record, then remove the value from the StartupApproved key shown (admin for HKLM) and it disappears from Task Manager:
+
+```powershell
+Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name '<Name>'
+```
+
+Run-key entries labelled `SYSTEM (not at logon)` sit in the LocalSystem profile (`HKU\.DEFAULT`, also reachable as `HKU\S-1-5-18`). They do not launch when a user signs in. Cleanup only, not a startup cost.
 
 Store apps do not appear in Installed Programs. Remove with:
 
@@ -198,6 +204,7 @@ Read the delta table with the run conditions in hand; a WORSE flag is not a regr
 - **Compare like with like.** `uptime_min`, `power_source` and the `top_cpu` list decide whether two runs are comparable. A run taken 5 minutes after boot with the indexer rebuilding will lose to one taken at idle on every CPU and disk line, and neither run is wrong.
 - **Noisy by nature:** `cpu_pct`, `cpu_freq_mhz`, `cpu_performance_pct`, `mem_pages_sec`, `gpu_3d_pct`, `dns_median_ms`. These are 10-second samples of a live machine; swings of tens of percent between runs are normal. Only a trend across several files is evidence.
 - **Stable, so a real signal when they move:** `process_count`, `services_running`, `reliability_index`, `battery_health_pct`, `dimms_populated`, `winsat_*`, `volume_free_pct`. A jump in `process_count` or `services_running` means something new is installed and resident; a falling `reliability_index` means new crashes.
+- Baselines written before v1.0.1 counted every Application-log event with id 1000/1002 as a crash or hang, including routine messages from other providers (the Codex sandbox service). Against such a file, a drop in `ev_app_crashes_7d` or `ev_app_hangs_7d` is the fix, not an improvement.
 - `seq_read_valid` false means `seq_read_mbps` measured RAM cache, not the disk. Do not compare those numbers across runs unless both say true.
 - To force a comparable pair, run both at the same point: a few minutes after a cold boot, on AC, with nothing open.
 

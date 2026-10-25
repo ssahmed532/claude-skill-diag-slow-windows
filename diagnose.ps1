@@ -77,6 +77,8 @@ Try-Run 'STORAGE' {
 	if ($isAdmin) { Get-BitLockerVolume | ForEach-Object { "BitLocker $($_.MountPoint): $($_.VolumeStatus) $($_.EncryptionMethod)" } } else { '  (BitLocker status needs elevation)' }
 	'-- cold-cache sequential read (read-only; only meaningful within ~10 min of a cold boot, otherwise it measures RAM cache) --'
 	$targets = @("$env:WINDIR\System32\MRT.exe"); $readMbps = @()
+	# Mark each figure, not just the header: a bare "315 MB/s" from RAM cache reads as a slow disk.
+	$coldValid = ((Get-Date) - $bootTime).TotalMinutes -lt 10
 	$big = Get-ChildItem "$env:ProgramFiles" -Recurse -File -Depth 4 | Where-Object Length -gt 200MB | Sort-Object Length -Descending | Select-Object -First 1
 	if ($big) { $targets += $big.FullName }
 	foreach ($t in $targets) {
@@ -85,11 +87,11 @@ Try-Run 'STORAGE' {
 		while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) { $tot += $n }
 		$sw.Stop(); $fs.Close()
 		$mbps = $tot/1MB/$sw.Elapsed.TotalSeconds
-		"  {0,-70} {1,6:N0} MB  {2,6:N0} MB/s" -f (Trunc $t 70), ($tot/1MB), $mbps
+		"  {0,-70} {1,6:N0} MB  {2,6:N0} MB/s{3}" -f (Trunc $t 70), ($tot/1MB), $mbps, $(if ($coldValid) { '' } else { '  INVALID: RAM cache, not the disk' })
 		$readMbps += [math]::Round($mbps)
 	}
 	Metric 'seq_read_mbps'      $readMbps
-	Metric 'seq_read_valid'     (((Get-Date) - $bootTime).TotalMinutes -lt 10)   # false = the figure is RAM cache, not the disk
+	Metric 'seq_read_valid'     $coldValid   # false = the figure is RAM cache, not the disk
 	Metric 'disks'              (Get-PhysicalDisk | ForEach-Object { "$($_.FriendlyName)=$($_.HealthStatus)" })
 	Metric 'volume_free_pct'    (Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | ForEach-Object { @{ drive = [string]$_.DriveLetter; free_pct = [math]::Round(100*$_.SizeRemaining/$_.Size); free_gb = [math]::Round($_.SizeRemaining/1GB) } })
 	if ($isAdmin) { Metric 'smart' (Get-PhysicalDisk | Get-StorageReliabilityCounter | ForEach-Object { @{ id = $_.DeviceId; temp_c = $_.Temperature; wear_pct = $_.Wear; read_err = $_.ReadErrorsTotal; write_err = $_.WriteErrorsTotal; power_on_hours = $_.PowerOnHours } }) }
@@ -213,10 +215,21 @@ Try-Run 'PROCESSES' {
 
 Try-Run 'STARTUP' {
 	'-- Run keys / Startup folders --'
-	Get-CimInstance Win32_StartupCommand | Select-Object Name, @{n='Where';e={ $_.Location -replace 'HKU\\S-1-5-21[^\\]+', 'HKCU' -replace 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\', '' }}, @{n='Cmd';e={ Trunc ($_.Command -replace '"','') 80 }} | Format-Table -AutoSize | Out-String -Width 220
-	'-- Task Manager approval state (02=enabled 03=disabled; entries without a matching Run key are stale) --'
+	# HKU\.DEFAULT and HKU\S-1-5-18 are the same LocalSystem hive under two names; its Run key does not fire at user
+	# logon, so label it and list it once instead of showing the same entry twice beside the real HKCU one.
+	Get-CimInstance Win32_StartupCommand | Select-Object Name, @{n='Where';e={ $_.Location -replace 'HKU\\S-1-5-21[^\\]+', 'HKCU' -replace 'HKU\\(S-1-5-18|\.DEFAULT)', 'SYSTEM (not at logon)' -replace 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\', '' }}, @{n='Cmd';e={ Trunc ($_.Command -replace '"','') 80 }} | Sort-Object Where, Name -Unique | Format-Table -AutoSize | Out-String -Width 220
+	'-- Task Manager approval state (first byte even = enabled, odd = disabled: 02/06 enabled, 03 disabled; STALE = no Run key or Startup-folder item of that name) --'
+	# Print the hive so the removal command for a stale entry is known (HKLM needs elevation). Match Run approvals
+	# against every Run key, including WOW6432Node, so an entry is never called stale because it lives in another hive.
+	$runNames = foreach ($r in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run') { (Get-Item $r).GetValueNames() }
+	$folderNames = (Get-ChildItem -LiteralPath ([Environment]::GetFolderPath('Startup')) -Force).Name
 	foreach ($k in 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run','HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder') {
-		$p = Get-ItemProperty $k; $p.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object { "  {0,-50} {1}" -f $_.Name, ('{0:X2}' -f $_.Value[0]) }
+		$present = if ($k -like '*StartupFolder') { $folderNames } else { $runNames }
+		$key = Get-Item $k
+		foreach ($name in $key.GetValueNames()) {
+			$b = ([byte[]]$key.GetValue($name))[0]
+			"  {0,-56} {1:X2} {2,-8} {3,-22} {4}" -f $name, $b, $(if ($b -band 1) { 'disabled' } else { 'enabled' }), ($k -replace ':.*StartupApproved', ''), $(if ($name -notin $present) { 'STALE' })
+		}
 	}
 	'-- Startup app launch timeline this boot (Shell-Core 9707 start / 9708 finish; the gap is what each Run entry cost) --'
 	$sc = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Shell-Core/Operational'; Id=9707,9708; StartTime=$bootTime } | Sort-Object TimeCreated
@@ -333,7 +346,11 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	'-- System log errors/criticals grouped --'
 	Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=$since } | Group-Object ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 12 Count, Name, @{n='Sample';e={ Trunc $_.Group[0].Message 110 }} | Format-Table -AutoSize | Out-String -Width 220
 	'-- Application hangs (1002) and crashes (1000) --'
-	Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000,1002; StartTime=$since } | ForEach-Object { [pscustomobject]@{ Kind=$(if ($_.Id -eq 1002) {'hang'} else {'crash'}); App=$_.Properties[0].Value } } | Group-Object Kind, App | Sort-Object Count -Descending | Select-Object -First 10 Count, Name | Format-Table -AutoSize | Out-String
+	# Ids 1000/1002 are only crashes and hangs when Windows Error Reporting logs them. Other providers reuse the
+	# same ids for routine messages: the Codex sandbox service logs "is running"/"has stopped" as 1000/1002.
+	$appFaults = Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='Application Error','Application Hang'; Id=1000,1002; StartTime=$since }
+	$appFaults | ForEach-Object { [pscustomobject]@{ Kind=$(if ($_.Id -eq 1002) {'hang'} else {'crash'}); App=$_.Properties[0].Value; Path=$(if ($_.Message -match '(?m)^(?:Faulting application path|Application Path):\s*(.+?)\s*$') { $Matches[1] } else { '?' }) } } | Group-Object Kind, App | Sort-Object Count -Descending | Select-Object -First 10 Count, Name, @{n='Path';e={ Trunc $_.Group[0].Path 110 }} | Format-Table -AutoSize | Out-String -Width 220
+	if (-not $appFaults) { '  none' }
 	'-- Hardware / storage / power warnings and errors, 30 days (WHEA, disk, Ntfs, volmgr, Kernel-Power 41) --'
 	$hw = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='disk','storahci','stornvme','Ntfs','volmgr','Microsoft-Windows-WHEA-Logger','Microsoft-Windows-Kernel-Power'; Level=1,2,3; StartTime=(Get-Date).AddDays(-30) } | Group-Object ProviderName, Id
 	if ($hw) { $hw | ForEach-Object { "  x$($_.Count)  $($_.Name)" } } else { '  none' }
@@ -387,8 +404,8 @@ Try-Run 'EVENT LOG (last 7 days unless stated)' {
 	Metric 'ev_7026_this_boot'  $(if ($e7026 -and $e7026.TimeCreated -gt $bootTime.AddMinutes(-5)) { 1 } else { 0 })
 	Metric 'ev_biometrics_1600' $bio1600.Count
 	Metric 'ev_sys_errors_7d'   ((Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=$since } | Measure-Object).Count)
-	Metric 'ev_app_crashes_7d'  ((Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000; StartTime=$since } | Measure-Object).Count)
-	Metric 'ev_app_hangs_7d'    ((Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1002; StartTime=$since } | Measure-Object).Count)
+	Metric 'ev_app_crashes_7d'  (@($appFaults | Where-Object Id -eq 1000).Count)
+	Metric 'ev_app_hangs_7d'    (@($appFaults | Where-Object Id -eq 1002).Count)
 	Metric 'ev_hw_warnings_30d' (@($hw | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum)
 	Metric 'ev_resource_exhaustion_30d' ((Get-WinEvent -FilterHashtable @{ LogName='System'; Id=2004; ProviderName='Microsoft-Windows-Resource-Exhaustion-Detector'; StartTime=(Get-Date).AddDays(-30) } | Measure-Object).Count)
 	Metric 'boot_services_up_s' $(if ($el) { [int]($el.TimeCreated - $k0).TotalSeconds } else { $null })
